@@ -11,11 +11,38 @@ param(
 $VBoxManage = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
 
 # Set the backup destination folder
-$BackupRoot = "Z:\VM_Backup"
+$BackupRoot = "Z:\BuildPC backup"
 
 # Set log file path
 $ScriptFolder = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $LogFile = Join-Path $ScriptFolder "backup_log.txt"
+
+# Function to clean up orphaned VDI registrations (from previous failed runs)
+function Clear-OrphanedVDIRegistrations {
+    param([string]$StagingPath)
+    
+    Write-Log "Checking for orphaned VDI registrations in staging paths..."
+    try {
+        # Get all registered media from VirtualBox
+        $registeredMedia = & $VBoxManage list hdds 2>$null
+        if ($registeredMedia) {
+            $registeredMedia | ForEach-Object {
+                if ($_ -match "Location:\s*(.+)" -and $matches[1] -like "*_vbbackup_staging*") {
+                    $orphanedPath = $matches[1].Trim()
+                    Write-Log "Found orphaned staging VDI registration: $orphanedPath"
+                    try {
+                        & $VBoxManage closemedium disk "$orphanedPath" --delete 2>$null
+                        Write-Log "Cleaned up orphaned VDI registration: $orphanedPath"
+                    } catch {
+                        Write-Log "Could not clean up orphaned VDI: $orphanedPath"
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Log "Warning: Could not check for orphaned VDI registrations: $($_.Exception.Message)"
+    }
+}
 
 # Reset the log file at the start of each run
 try {
@@ -75,11 +102,12 @@ function Get-DriveFreeBytes {
     }
 }
 
-# Copy a single file with 10% progress logging
+# Copy a single file with 10% progress logging and timeout detection
 function Copy-FileWithProgress {
     param(
         [Parameter(Mandatory)] [string]$Source,
-        [Parameter(Mandatory)] [string]$Destination
+        [Parameter(Mandatory)] [string]$Destination,
+        [int]$TimeoutMinutes = 180  # Default 3 hour timeout for large files
     )
     $srcInfo = Get-Item -LiteralPath $Source -ErrorAction Stop
     $destDir = Split-Path -Parent $Destination
@@ -94,10 +122,14 @@ function Copy-FileWithProgress {
         return
     }
 
+    Write-Log "Starting copy of $(Format-Bytes $total) file with $TimeoutMinutes minute timeout"
     $bufferSize = 8MB
     $buffer = New-Object byte[] $bufferSize
     $bytesCopied = 0L
     $nextMark = 0
+    $lastProgressTime = Get-Date
+    $startTime = Get-Date
+    $timeoutSeconds = $TimeoutMinutes * 60
 
     Write-Log "0%..."
     $in = [System.IO.File]::OpenRead($Source)
@@ -107,10 +139,28 @@ function Copy-FileWithProgress {
             while (($read = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
                 $out.Write($buffer, 0, $read)
                 $bytesCopied += $read
+                $currentTime = Get-Date
+                
+                # Check for timeout
+                if (($currentTime - $startTime).TotalSeconds -gt $timeoutSeconds) {
+                    throw "Copy operation timed out after $TimeoutMinutes minutes"
+                }
+                
                 $pct = [math]::Floor(($bytesCopied / $total) * 100)
                 while ($pct -ge $nextMark + 10 -and $nextMark -lt 100) {
                     $nextMark += 10
-                    Write-Log "$nextMark%..."
+                    $elapsed = ($currentTime - $startTime).TotalMinutes
+                    $rate = if ($elapsed -gt 0) { ($bytesCopied / 1MB) / $elapsed } else { 0 }
+                    Write-Log "$nextMark%... ($(Format-Bytes $bytesCopied)/$(Format-Bytes $total), Rate: $([math]::Round($rate, 1)) MB/min, Elapsed: $([math]::Round($elapsed, 1)) min)"
+                    $lastProgressTime = $currentTime
+                }
+                
+                # Log heartbeat for very large files (every 5 minutes without other progress)
+                if (($currentTime - $lastProgressTime).TotalMinutes -gt 5) {
+                    $elapsed = ($currentTime - $startTime).TotalMinutes
+                    $rate = if ($elapsed -gt 0) { ($bytesCopied / 1MB) / $elapsed } else { 0 }
+                    Write-Log "Copy still in progress: $pct% (Rate: $([math]::Round($rate, 1)) MB/min)"
+                    $lastProgressTime = $currentTime
                 }
             }
         } finally {
@@ -119,6 +169,9 @@ function Copy-FileWithProgress {
     } finally {
         $in.Dispose()
     }
+    
+    $totalTime = ((Get-Date) - $startTime).TotalMinutes
+    Write-Log "Copy completed in $([math]::Round($totalTime, 1)) minutes"
 }
 
 # Compute relative path of a file under a base folder (case-insensitive),
@@ -140,6 +193,9 @@ if (!(Test-Path $BackupRoot)) {
     New-Item -ItemType Directory -Path $BackupRoot | Out-Null
     Write-Log "Created backup root folder: $BackupRoot"
 }
+
+# Clean up any orphaned VDI registrations from previous failed runs
+Clear-OrphanedVDIRegistrations
 
 # Get list of all VMs
 $VMs = & $VBoxManage list vms
@@ -229,12 +285,9 @@ foreach ($VM in $VMs) {
             }
 
             # Copy VM folder (configs, snapshots, etc.), but skip .vdi files
-            $ExcludeVDI = @($VDIFiles | ForEach-Object { $_.FullName })
             $ItemsToCopy = $nonVDIFiles
             $TotalItems = $ItemsToCopy.Count
             $LastLoggedPercent = -1
-            # Normalize VMFolder to ensure trailing backslash for relative path calc
-            $VMFolderNorm = if ($VMFolder.EndsWith('\')) { $VMFolder } else { "$VMFolder\" }
             for ($i = 0; $i -lt $TotalItems; $i++) {
                 $Item = $ItemsToCopy[$i]
                 $relative = Get-RelativePath -BaseFolder $VMFolder -FullPath $Item.FullName
@@ -246,11 +299,23 @@ foreach ($VM in $VMs) {
                 } else {
                     # Safety guard: skip if destination resolves to the same path
                     if ($Dest -ieq $Item.FullName) { continue }
+                    
+                    # Check if file exists before attempting to copy (skip temporary files that may not exist)
+                    if (!(Test-Path -LiteralPath $Item.FullName)) {
+                        Write-Log "Skipping non-existent file: $($Item.FullName)"
+                        continue
+                    }
+                    
                     try {
                         Copy-Item -Path $Item.FullName -Destination $Dest -Force -ErrorAction Stop
                     } catch {
-                        $vmHadError = $true
-                        Write-Log "Copy error for ${VMName}: $($Item.FullName) -> $Dest : $($_.Exception.Message)"
+                        # For .vbox-tmp files and other temporary files, log as warning rather than error
+                        if ($Item.Name -match '\.(tmp|temp)$' -or $Item.Name -like '*-tmp*') {
+                            Write-Log "Warning: Could not copy temporary file ${VMName}: $($Item.FullName) -> $Dest : $($_.Exception.Message)"
+                        } else {
+                            $vmHadError = $true
+                            Write-Log "Copy error for ${VMName}: $($Item.FullName) -> $Dest : $($_.Exception.Message)"
+                        }
                     }
                 }
                 $Percent = [math]::Floor((($i + 1) / $TotalItems) * 100)
@@ -263,8 +328,23 @@ foreach ($VM in $VMs) {
             # Stage and compact each VDI locally under the VM folder if space permits; otherwise fallback to direct copy
             $StagingFolder = Join-Path $VMFolder "_vbbackup_staging"
             if ($VDIFiles -and $CanStageLocally) {
+                # Enhanced cleanup: First unregister any VDIs that might be registered from previous failed runs
                 if (Test-Path -LiteralPath $StagingFolder) {
-                    try { Remove-Item -LiteralPath $StagingFolder -Recurse -Force -ErrorAction Stop } catch {}
+                    try {
+                        # Find any VDI files in staging and attempt to unregister them from VirtualBox
+                        $stagingVDIs = Get-ChildItem -Path $StagingFolder -Filter "*.vdi" -Recurse -ErrorAction SilentlyContinue
+                        foreach ($stagingVDI in $stagingVDIs) {
+                            try {
+                                & $VBoxManage closemedium disk "$($stagingVDI.FullName)" --delete 2>$null
+                            } catch {
+                                # Ignore errors - the VDI might not be registered
+                            }
+                        }
+                        Remove-Item -LiteralPath $StagingFolder -Recurse -Force -ErrorAction Stop
+                        Write-Log "Cleaned up existing staging folder and unregistered orphaned VDIs"
+                    } catch {
+                        Write-Log "Warning: Could not fully clean staging folder: $($_.Exception.Message)"
+                    }
                 }
                 New-Item -ItemType Directory -Path $StagingFolder -Force | Out-Null
             }
@@ -282,10 +362,28 @@ foreach ($VM in $VMs) {
                     }
 
                     Write-Log "Cloning to local staging: $($VDI.FullName) -> $LocalStagedVDI"
-                    & $VBoxManage clonemedium "$( $VDI.FullName )" "$LocalStagedVDI" --format=VDI --variant=Standard
+                    
+                    # Enhanced cloning with better error handling and UUID management
+                    $cloneResult = & $VBoxManage clonemedium "$( $VDI.FullName )" "$LocalStagedVDI" --format=VDI --variant=Standard 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        # If clone failed due to UUID conflict, try to close/unregister the conflicting medium first
+                        if ($cloneResult -match "already exists" -and $cloneResult -match "UUID") {
+                            Write-Log "UUID conflict detected, attempting to resolve..."
+                            try {
+                                & $VBoxManage closemedium disk "$LocalStagedVDI" --delete 2>$null
+                                Start-Sleep -Seconds 2
+                                # Retry the clone operation
+                                $cloneResult = & $VBoxManage clonemedium "$( $VDI.FullName )" "$LocalStagedVDI" --format=VDI --variant=Standard 2>&1
+                            } catch {
+                                Write-Log "Failed to resolve UUID conflict: $($_.Exception.Message)"
+                            }
+                        }
+                    }
+                    
                     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $LocalStagedVDI)) {
                         $vmHadError = $true
                         Write-Log "Clone error for ${VMName}: $( $VDI.FullName )"
+                        Write-Log "VBoxManage output: $cloneResult"
                         continue
                     }
 
@@ -302,10 +400,17 @@ foreach ($VM in $VMs) {
                         Copy-FileWithProgress -Source $LocalStagedVDI -Destination $DestVDI
                         # Remove staged file to free space before processing next VDI
                         try {
-                            Remove-Item -LiteralPath $LocalStagedVDI -Force
-                            Write-Log "Removed staged file to free space: $LocalStagedVDI"
+                            # First try to unregister the VDI from VirtualBox if it's registered
+                            & $VBoxManage closemedium disk "$LocalStagedVDI" --delete 2>$null
+                            Write-Log "Unregistered and removed staged file: $LocalStagedVDI"
                         } catch {
-                            Write-Log "Warning: could not remove staged file $LocalStagedVDI : $($_.Exception.Message)"
+                            # If unregister fails, try manual file deletion
+                            try {
+                                Remove-Item -LiteralPath $LocalStagedVDI -Force
+                                Write-Log "Removed staged file to free space: $LocalStagedVDI"
+                            } catch {
+                                Write-Log "Warning: could not remove staged file $LocalStagedVDI : $($_.Exception.Message)"
+                            }
                         }
                     } catch {
                         $vmHadError = $true
@@ -325,13 +430,29 @@ foreach ($VM in $VMs) {
                 }
             }
 
-            # Cleanup staging
+            # Enhanced cleanup staging - unregister any remaining VDIs first
             if (Test-Path -LiteralPath $StagingFolder) {
                 try {
+                    # Find and unregister any remaining VDI files
+                    $remainingVDIs = Get-ChildItem -Path $StagingFolder -Filter "*.vdi" -Recurse -ErrorAction SilentlyContinue
+                    foreach ($remainingVDI in $remainingVDIs) {
+                        try {
+                            & $VBoxManage closemedium disk "$($remainingVDI.FullName)" --delete 2>$null
+                        } catch {
+                            # Ignore errors - some VDIs might not be registered
+                        }
+                    }
                     Remove-Item -LiteralPath $StagingFolder -Recurse -Force
                     Write-Log "Cleaned up staging folder: $StagingFolder"
                 } catch {
                     Write-Log "Staging cleanup warning for ${VMName}: $($_.Exception.Message)"
+                    # Force cleanup by trying to remove files individually
+                    try {
+                        Get-ChildItem -Path $StagingFolder -Recurse -Force | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+                        Remove-Item -Path $StagingFolder -Force -ErrorAction SilentlyContinue
+                    } catch {
+                        Write-Log "Force cleanup also failed for staging folder"
+                    }
                 }
             }
 
